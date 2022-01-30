@@ -1,36 +1,31 @@
-import matplotlib.pyplot as plt
 import torch
 from PIL import Image
 from pydantic import BaseModel
-from torch import nn
+from torch import Tensor
+from torch.nn import Module, ReLU
 from torch.nn.functional import mse_loss
 from torch.optim import LBFGS, Optimizer
 from torchvision.transforms import ToPILImage
 
 from .config import get_settings
+from .helpers import replace_layers
 
 settings = get_settings()
 
 
 class StyleTransferConfig(BaseModel):
-    model: nn.Module
-    # Note: Your model should be pre-trained on ImageNet and from torchvision.models
+    model: Module
+    # Note: Your model should be pre-trained on
+    # ImageNet and from torchvision.models
     feature_layers: list[int]
 
     class Config:
         arbitrary_types_allowed = True
 
 
-class ContentLoss(nn.Module):
-    def __init__(
-        self,
-        target,
-    ):
+class ContentLoss(Module):
+    def __init__(self, target: Tensor) -> None:
         super(ContentLoss, self).__init__()
-        # We 'detach' the target content from the tree used
-        # to dynamically compute the gradient: this is a stated value,
-        # not a variable. Otherwise the forward method of the criterion
-        # will throw an error
         self.target = target.detach()
 
     def forward(self, input):
@@ -38,34 +33,36 @@ class ContentLoss(nn.Module):
         return input
 
 
-class StyleLoss(nn.Module):
-    def __init__(self, target_feature):
+class StyleLoss(Module):
+    def __init__(self, target: Tensor) -> None:
         super(StyleLoss, self).__init__()
-        self.target = self.gram_matrix(target_feature).detach()
+        self.target = self.gram_matrix(target).detach()
 
     @staticmethod
-    def gram_matrix(input):
-        a, b, c, d = input.size()
-        # a: batch size (= 1)
-        # b: number of feature maps
-        # c & d: dimensions of a f. map (N=c*d)
+    def gram_matrix(input) -> Tensor:
+        (batch_size, no_of_feature_maps, x, y) = input.size()
+        # Re-size:
+        features = input.view(
+            batch_size * no_of_feature_maps,
+            x * y,
+        )
+        # Compute the gram product:
+        g = torch.mm(features, features.t())
+        # 'Normalize' the values of the gram matrix:
+        g_norm = g.div(batch_size * no_of_feature_maps * x * y)
+        return g_norm
 
-        features = input.view(a * b, c * d)  # Resize F_XL into \hat F_XL
-
-        G = torch.mm(features, features.t())  # Compute the gram product
-
-        # We 'normalize' the values of the gram matrix
-        # by dividing by the number of element in each feature maps
-        return G.div(a * b * c * d)
-
-    def forward(self, input):
-        G = self.gram_matrix(input)
-        self.loss = mse_loss(G, self.target)
+    def forward(self, input: Tensor):
+        g_input = self.gram_matrix(input)
+        self.loss = mse_loss(g_input, self.target)
         return input
 
 
-class StyleTransferModel(nn.Module):
-    def __init__(self, style_transfer_config: StyleTransferConfig):
+class StyleTransferModel(Module):
+    def __init__(
+        self,
+        style_transfer_config: StyleTransferConfig,
+    ) -> None:
         super(StyleTransferModel, self).__init__()
 
         # Initialise which layers to use for feature extration
@@ -75,12 +72,20 @@ class StyleTransferModel(nn.Module):
         # Get model and clip based on selected feature layers
         self.model = style_transfer_config.model.features[: max_layer + 1]
 
-    def forward(self, x):
+        # Modify the ReLU layers
+        # replace_layers(self.model, ReLU, ReLU(inplace=False))
+
+        # Turn on evaluation mode:
+        self.model.eval()
+
+    def forward(self, x: Tensor) -> list[Tensor]:
         features = []
 
         for (layer_num, layer) in enumerate(self.model):
+            x = layer(x)
+
             if layer_num in self.feature_layers:
-                features.append(layer(x))
+                features.append(x)
 
         return features
 
@@ -95,14 +100,12 @@ class StyleTransfer:
         style_weight: int = 1000000,
         content_weight: int = 1,
     ) -> None:
-        # Initialise all the images
-        self.content_image = content_image
-        self.style_image = style_image
-        self.generated_image = self.content_image.clone()
+        # Initialise image for generation
+        self.generated_image = content_image.clone()
         self.generated_image.requires_grad_(True)
 
-        # Initialise the model and freeze it
-        self.model = style_transfer_model.eval()
+        # Initialise the model
+        self.model = style_transfer_model
 
         # Initialise the optimiser
         self.optimiser = optimiser([self.generated_image])
@@ -113,36 +116,31 @@ class StyleTransfer:
         self.style_weight = style_weight
 
         # Initialise style & content losses
-        self.content_losses = self.get_content_losses()
-        self.style_losses = self.get_style_losses()
+        self.content_losses = self._get_content_losses(content_image)
+        self.style_losses = self._get_style_losses(style_image)
 
         # Initlise transform back to PIL Image
         # (for displaying generated images)
         self.unloader = ToPILImage()
 
-    def get_content_losses(self):
-        content_losses = []
-
-        target = self.model(self.content_image).detach()
-        content_loss = ContentLoss(target)
-        content_losses.append(content_loss)
-
+    def _get_content_losses(self, content_image):
+        target_features = self.model(content_image)
+        content_losses = [ContentLoss(feature.detach()) for feature in target_features]
         return content_losses
 
-    def get_style_losses(self):
-        style_losses = []
-
-        target_feature = self.model(self.style_image).detach()
-        style_loss = StyleLoss(target_feature)
-        style_losses.append(style_loss)
-
+    def _get_style_losses(self, style_image):
+        target_features = self.model(style_image)
+        style_losses = [StyleLoss(feature.detach()) for feature in target_features]
         return style_losses
 
-    def optimisation_step(self, current_iteration_no: int):
+    def _optimisation_step(self, current_iteration_no: int):
+        # Initialise
+        self.optimiser.zero_grad()
         self.model(self.generated_image)
         style_score = 0
         content_score = 0
 
+        # Calculate losses:
         for sl in self.style_losses:
             style_score += sl.loss
         for cl in self.content_losses:
@@ -152,11 +150,9 @@ class StyleTransfer:
         content_score *= self.content_weight
 
         loss = style_score + content_score
-
-        self.optimiser.zero_grad()
         loss.backward()
-        self.optimiser.step()
 
+        # Report process every 50 steps
         if (current_iteration_no + 1) % 50 == 0:
             print(f"Run #{current_iteration_no + 1}")
             print(
@@ -170,13 +166,15 @@ class StyleTransfer:
         # Update the total number of iterations performed
         self.total_iterations += 1
 
-        return style_score + content_score
+        return loss
 
     def optimise(self, iterations: int = 100):
         for i in range(iterations):
-            self.optimisation_step(i)
+            self.optimiser.step(
+                self._optimisation_step(i),
+            )
 
-    def show_generated_image(self):
+    def get_generated_image(self) -> Image:
         image_cloned = self.generated_image.cpu().clone()
 
         # Remove the fake batch dimension:
@@ -185,7 +183,4 @@ class StyleTransfer:
         # Convert back to PIL Image
         image_converted = self.unloader(image_squeezed)
 
-        # Display the image
-        plt.imshow(image_converted)
-        plt.title("Title")
-        plt.show()
+        return image_converted
