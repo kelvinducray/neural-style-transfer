@@ -2,7 +2,7 @@ import torch
 from PIL import Image
 from pydantic import BaseModel
 from torch import Tensor
-from torch.nn import Module, ReLU
+from torch.nn import Module, ReLU, Sequential
 from torch.nn.functional import mse_loss
 from torch.optim import LBFGS, Optimizer
 from torchvision.transforms import ToPILImage
@@ -13,14 +13,16 @@ from .helpers import replace_layers
 settings = get_settings()
 
 
-class StyleTransferConfig(BaseModel):
-    model: Module
-    # Note: Your model should be pre-trained on
-    # ImageNet and from torchvision.models
-    feature_layers: list[int]
+# class StyleTransferConfig(BaseModel):
+#     model: Module
+#     # Note: Your model should be pre-trained on
+#     # ImageNet and from torchvision.models
 
-    class Config:
-        arbitrary_types_allowed = True
+#     style_feature_layers: list[int]
+#     content_feature_layers: list[int]
+
+#     class Config:
+#         arbitrary_types_allowed = True
 
 
 class ContentLoss(Module):
@@ -61,22 +63,58 @@ class StyleLoss(Module):
 class StyleTransferModel(Module):
     def __init__(
         self,
-        style_transfer_config: StyleTransferConfig,
+        base_model: Module,
+        style_image: Image,
+        content_image: Image,
+        style_feature_layers: list[int],
+        content_feature_layers: list[int],
     ) -> None:
         super(StyleTransferModel, self).__init__()
 
-        # Initialise which layers to use for feature extration
-        self.feature_layers = style_transfer_config.feature_layers
-        max_layer = max(self.feature_layers)
+        style_features = self._get_features(base_model, style_feature_layers, style_image,)
+        content_features = self._get_features(base_model, content_feature_layers, content_image,)
+
+        max_layer = max(style_feature_layers + content_feature_layers)
 
         # Get model and clip based on selected feature layers
-        self.model = style_transfer_config.model.features[: max_layer + 1]
+        self.model = self._build_model(base_model, st_config.style_feature_layers, st_config.content_feature_layers,)
 
         # Modify the ReLU layers
         # replace_layers(self.model, ReLU, ReLU(inplace=False))
 
         # Turn on evaluation mode:
         self.model.eval()
+    
+    # Use forward hooks $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+    def _get_features(base_model, feature_layers, image):
+        current_max_layer = max(feature_layers)
+        features = {}
+        for i, layer in range(model_clipped.features):
+            model_w_loss_layers.add_module(layer)
+
+            if 
+                break
+        
+        return features
+
+    def _build_model(
+        input_model: Module,
+        
+    ) -> Module:
+        max_layer = max(style_feature_layers + content_feature_layers)
+        model_clipped = input_model.features[: max_layer + 1]
+        model_w_loss_layers = Sequential()
+
+        for i, layer in range(model_clipped.features):
+            model_w_loss_layers.add_module(layer)
+            if i in style_feature_layers:
+                model_w_loss_layers.add_module(StyleLoss())
+            if i in content_feature_layers:
+                model_w_loss_layers.add_module(StyleLoss())
+
+
+        return model_w_loss_layers
+
 
     def forward(self, x: Tensor) -> list[Tensor]:
         features = []
@@ -89,14 +127,22 @@ class StyleTransferModel(Module):
 
         return features
 
+        return style_loss, content_loss
+
 
 class StyleTransfer:
     def __init__(
         self,
-        content_image: Image,
+        # Images
         style_image: Image,
-        style_transfer_model: StyleTransferModel,
+        content_image: Image,
+        # Model
+        base_model: Module,
+        style_feature_layers: list[int],
+        content_feature_layers: list[int],
+        # Optimiser for style transfer
         optimiser: Optimizer = LBFGS,
+        # Hyperparameters
         style_weight: int = 1000000,
         content_weight: int = 1,
     ) -> None:
@@ -105,7 +151,13 @@ class StyleTransfer:
         self.generated_image.requires_grad_(True)
 
         # Initialise the model
-        self.model = style_transfer_model
+        self.style_transfer_model = StyleTransferModel(
+            base_model,
+            style_image,
+            content_image,
+            style_feature_layers,
+            content_feature_layers,
+        )
 
         # Initialise the optimiser
         self.optimiser = optimiser([self.generated_image])
@@ -115,40 +167,27 @@ class StyleTransfer:
         self.content_weight = content_weight
         self.style_weight = style_weight
 
-        # Initialise style & content losses
-        self.content_losses = self._get_content_losses(content_image)
-        self.style_losses = self._get_style_losses(style_image)
-
         # Initlise transform back to PIL Image
         # (for displaying generated images)
         self.unloader = ToPILImage()
 
-    def _get_content_losses(self, content_image):
-        target_features = self.model(content_image)
-        content_losses = [ContentLoss(feature.detach()) for feature in target_features]
-        return content_losses
-
-    def _get_style_losses(self, style_image):
-        target_features = self.model(style_image)
-        style_losses = [StyleLoss(feature.detach()) for feature in target_features]
-        return style_losses
-
     def _optimisation_step(self, current_iteration_no: int):
         # Initialise
         self.optimiser.zero_grad()
-        self.model(self.generated_image)
+        generated_features = self.model(self.generated_image)
         style_score = 0
         content_score = 0
 
         # Calculate losses:
-        for sl in self.style_losses:
-            style_score += sl.loss
-        for cl in self.content_losses:
-            content_score += cl.loss
+        style_score, content_score = self.style_transfer_model(
+            generated_features,
+        )
 
+        # Adjust scores based on hyperparams.
         style_score *= self.style_weight
         content_score *= self.content_weight
 
+        # Calculate total loss
         loss = style_score + content_score
         loss.backward()
 
@@ -156,7 +195,7 @@ class StyleTransfer:
         if (current_iteration_no + 1) % 50 == 0:
             print(f"Run #{current_iteration_no + 1}")
             print(
-                f"Style loss: {style_score.item():4f}, Content loss: {content_score.item():4f}"
+                f"Style loss: {style_score:4f}, Content loss: {content_score.:4f}"
             )
 
         # Correct the values of updated input image
