@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     CONTENT_IMG_DIR: str = "./images/content_images"
 
 
+# Allows us to cache the result
+# (so we can use it across multiple scripts)
 @lru_cache
 def get_settings():
     return Settings()
