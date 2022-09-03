@@ -91,6 +91,7 @@ class FeatureExtractor(Module):
         return self.model(x)
 
     def get_features(self):
+        print({k: v.size() for k, v in self.output_features.items()})
         return self.output_features
 
 
@@ -271,10 +272,8 @@ class StyleTransferOptimiser:
 
     def get_generated_image(self) -> Image:
         image_cloned = self.generated_image.cpu().clone()
-
         # Remove the fake batch dimension:
         image_squeezed = image_cloned.squeeze(0)
-
         # Convert back to PIL Image
         image_converted = self.unloader(image_squeezed)
 
